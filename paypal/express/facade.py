@@ -1,28 +1,25 @@
 """
-Responsible for briding between Oscar and the PayPal gateway
+Responsible for bridging between Oscar and the PayPal gateway
 """
+import json
+
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.core.exceptions import ImproperlyConfigured
 from django.urls import reverse
 
-from paypal.express.gateway import (
-    AUTHORIZATION, DO_EXPRESS_CHECKOUT, ORDER, SALE, buyer_pays_on_paypal, do_capture, do_txn, do_void,
-    get_txn, refund_txn, set_txn)
-from paypal.express.models import ExpressTransaction as Transaction
+from paypal.express.gateway import PaymentProcessor
+from paypal.express.models import ExpressCheckoutTransaction as Transaction
 
 
-def _get_payment_action():
-    # PayPal supports 3 actions: 'Sale', 'Authorization', 'Order'
-    action = getattr(settings, 'PAYPAL_PAYMENT_ACTION', SALE)
-    if action not in (SALE, AUTHORIZATION, ORDER):
-        raise ImproperlyConfigured("'%s' is not a valid payment action" % action)
-    return action
+def get_intent():
+    intent = getattr(settings, 'PAYPAL_ORDER_INTENT', Transaction.CAPTURE)
+    if intent not in (Transaction.CAPTURE, Transaction.AUTHORIZE):
+        raise ImproperlyConfigured('{} is not a valid order intent'.format(intent))
+    return intent
 
 
-def get_paypal_url(basket, shipping_methods, user=None, shipping_address=None,
-                   shipping_method=None, host=None, scheme=None,
-                   paypal_params=None):
+def get_paypal_url(basket, user=None, shipping_address=None, shipping_method=None, host=None):
     """
     Return the URL for a PayPal Express transaction.
 
@@ -37,84 +34,108 @@ def get_paypal_url(basket, shipping_methods, user=None, shipping_address=None,
         currency = getattr(settings, 'PAYPAL_CURRENCY', 'GBP')
     if host is None:
         host = Site.objects.get_current().domain
-    if scheme is None:
-        use_https = getattr(settings, 'PAYPAL_CALLBACK_HTTPS', True)
-        scheme = 'https' if use_https else 'http'
+    scheme = getattr(settings, 'PAYPAL_CALLBACK_SCHEME', 'https')
+    return_url_path = reverse('paypal-success-response', kwargs={'basket_id': basket.id})
+    return_url = '{0}://{1}{2}'.format(scheme, host, return_url_path)
 
-    response_view_name = 'paypal-handle-order' if buyer_pays_on_paypal() else 'paypal-success-response'
-    return_url = '%s://%s%s' % (scheme, host, reverse(response_view_name, kwargs={'basket_id': basket.id}))
-    cancel_url = '%s://%s%s' % (scheme, host, reverse('paypal-cancel-response', kwargs={'basket_id': basket.id}))
+    cancel_url_path = reverse('paypal-cancel-response', kwargs={'basket_id': basket.id})
+    cancel_url = '{0}://{1}{2}'.format(scheme, host, cancel_url_path)
 
-    # URL for updating shipping methods - we only use this if we have a set of
-    # shipping methods to choose between.
-    update_url = None
-    if shipping_methods:
-        update_url = '%s://%s%s' % (scheme, host, reverse('paypal-shipping-options', kwargs={'basket_id': basket.id}))
-
-    # Determine whether a shipping address is required
-    no_shipping = False
-    if not basket.is_shipping_required():
-        no_shipping = True
-
-    # Pass a default billing address is there is one.  This means PayPal can
-    # pre-fill the registration form.
     address = None
-    if user:
-        addresses = user.addresses.all().order_by('-is_default_for_billing')
-        if len(addresses):
-            address = addresses[0]
+    if basket.is_shipping_required():
+        if shipping_address is not None:
+            address = shipping_address
+        elif user is not None:
+            addresses = user.addresses.all().order_by('-is_default_for_billing')
+            if addresses.exists():
+                address = addresses.first()
 
-    return set_txn(basket=basket,
-                   shipping_methods=shipping_methods,
-                   currency=currency,
-                   return_url=return_url,
-                   cancel_url=cancel_url,
-                   update_url=update_url,
-                   action=_get_payment_action(),
-                   shipping_method=shipping_method,
-                   shipping_address=shipping_address,
-                   user=user,
-                   user_address=address,
-                   no_shipping=no_shipping,
-                   paypal_params=paypal_params)
+    shipping_charge = None
+    order_total = basket.total_incl_tax
+    if shipping_method:
+        shipping_charge = shipping_method.calculate(basket).incl_tax
+        order_total += shipping_charge
+
+    intent = get_intent()
+
+    result = PaymentProcessor().create_order(
+        basket=basket,
+        currency=currency,
+        return_url=return_url,
+        cancel_url=cancel_url,
+        order_total=order_total,
+        address=address,
+        shipping_charge=shipping_charge,
+        intent=intent,
+    )
+
+    Transaction.objects.create(
+        order_id=result.id,
+        amount=order_total,
+        currency=currency,
+        status=result.status,
+        intent=intent,
+    )
+
+    for link in result.links:
+        if link.rel == 'approve':
+            return link.href
 
 
 def fetch_transaction_details(token):
     """
-    Fetch the completed details about the PayPal transaction.
+    Fetch the details about the PayPal transaction.
     """
-    return get_txn(token)
+    transaction = Transaction.objects.get(order_id=token)
+
+    if not transaction.payer_id:
+        result = PaymentProcessor().get_order(token)
+        transaction.payer_id = result.payer.payer_id
+        transaction.email = result.payer.email_address
+        transaction.address_full_name = result.purchase_units[0].shipping.name.full_name
+        transaction.address = json.dumps(result.purchase_units[0].shipping.address.dict())
+        transaction.save()
+
+    if transaction.is_authorization:
+        result = PaymentProcessor().authorize_order(transaction.order_id)
+        transaction.authorization_id = result.purchase_units[0].payments.authorizations[0].id
+        transaction.save()
+
+    return transaction
 
 
-def confirm_transaction(payer_id, token, amount, currency):
-    """
-    Confirm the payment action.
-    """
-    return do_txn(payer_id, token, amount, currency,
-                  action=_get_payment_action())
+def capture_order(token):
+    transaction = Transaction.objects.get(order_id=token)
+    if transaction.is_authorization:
+        capture_token = transaction.authorization_id
+    else:
+        capture_token = transaction.order_id
+
+    result = PaymentProcessor().capture_order(capture_token, transaction.intent)
+    transaction.capture_id = result.id
+    transaction.status = result.status
+    transaction.save()
+    return transaction
 
 
-def refund_transaction(token, amount, currency, note=None):
-    txn = Transaction.objects.get(token=token,
-                                  method=DO_EXPRESS_CHECKOUT)
-    is_partial = amount < txn.amount
-    return refund_txn(txn.value('PAYMENTINFO_0_TRANSACTIONID'), is_partial, amount, currency)
+def refund_order(token):
+    transaction = Transaction.objects.get(order_id=token)
+
+    result = PaymentProcessor().refund_order(transaction.capture_id, transaction.amount, transaction.currency)
+
+    transaction.refund_id = result.id
+    transaction.save()
+    return transaction
 
 
-def capture_authorization(token, note=None):
-    """
-    Capture a previous authorization.
-    """
-    txn = Transaction.objects.get(token=token,
-                                  method=DO_EXPRESS_CHECKOUT)
-    return do_capture(txn.value('PAYMENTINFO_0_TRANSACTIONID'),
-                      txn.amount, txn.currency, note=note)
-
-
-def void_authorization(token, note=None):
+def void_authorization(token):
     """
     Void a previous authorization.
     """
-    txn = Transaction.objects.get(token=token,
-                                  method=DO_EXPRESS_CHECKOUT)
-    return do_void(txn.value('PAYMENTINFO_0_TRANSACTIONID'), note=note)
+    transaction = Transaction.objects.get(order_id=token)
+
+    PaymentProcessor().void_authorized_order(transaction.authorization_id)
+
+    transaction.status = Transaction.VOIDED
+    transaction.save()
+    return transaction

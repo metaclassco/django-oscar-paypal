@@ -1,26 +1,33 @@
 # -*- coding: utf-8 -*-
 from decimal import Decimal as D
+from unittest import skip
 from unittest.mock import Mock, patch
+from urllib.parse import urlencode
 
 from django.test import TestCase, override_settings
 from django.test.client import Client
 from django.urls import reverse
-from django.utils.encoding import force_text
+
 from oscar.apps.basket.models import Basket
+from oscar.apps.checkout.utils import CheckoutSessionData
 from oscar.apps.order.models import Order
-from oscar.core.loading import get_classes
 from oscar.test.factories import create_product
+
+from paypalhttp.http_error import HttpError
+from paypalhttp.http_response import construct_object
 from purl import URL
 
-Partner, StockRecord = get_classes('partner.models', ('Partner',
-                                                      'StockRecord'))
+from paypal.express.models import ExpressCheckoutTransaction
+from tests.shipping.methods import SecondClassRecorded
+from .mocked_data import CAPTURE_ORDER_RESULT_DATA_MINIMAL, CREATE_ORDER_RESULT_DATA_MINIMAL, GET_ORDER_RESULT_DATA
 
-(ProductClass,
- Product,
- ProductAttribute,
- ProductAttributeValue) = get_classes(
-    'catalogue.models', ('ProductClass', 'Product', 'ProductAttribute', 'ProductAttributeValue')
-)
+
+class BasketMixin:
+
+    def add_product_to_basket(self, price=D('100.00')):
+        product = create_product(price=price, num_in_stock=1)
+        url = reverse('basket:add', kwargs={'pk': product.pk})
+        self.client.post(url, {'quantity': 1})
 
 
 class MockedPayPalTests(TestCase):
@@ -51,28 +58,24 @@ class MockedPayPalTests(TestCase):
         self.client.post(url, {'quantity': 1})
 
 
-class EdgeCaseTests(MockedPayPalTests):
+class EdgeCaseTests(BasketMixin, TestCase):
 
     def setUp(self):
-        self.client = Client()
+        super().setUp()
+        self.url = reverse('paypal-redirect')
 
     def test_empty_basket_shows_error(self):
-        url = reverse('paypal-redirect')
-        response = self.client.get(url)
-        self.assertEqual(reverse('basket:summary'), URL.from_string(response['Location']).path())
+        response = self.client.get(self.url)
+        assert reverse('basket:summary') == response.url
 
     def test_missing_shipping_address(self):
         from paypal.express.views import RedirectView
         with patch.object(RedirectView, 'as_payment_method') as as_payment_method:
             as_payment_method.return_value = True
 
-            url = reverse('paypal-redirect')
             self.add_product_to_basket()
-            response = self.client.get(url)
-            self.assertEqual(
-                reverse('checkout:shipping-address'),
-                URL.from_string(response['Location']).path()
-            )
+            response = self.client.get(self.url)
+            assert reverse('checkout:shipping-address') == response.url
 
     def test_missing_shipping_method(self):
         from paypal.express.views import RedirectView
@@ -85,13 +88,9 @@ class EdgeCaseTests(MockedPayPalTests):
                     get_shipping_address.return_value = Mock()
                     get_shipping_method.return_value = None
 
-                    url = reverse('paypal-redirect')
                     self.add_product_to_basket()
-                    response = self.client.get(url)
-                    self.assertEqual(
-                        reverse('checkout:shipping-method'),
-                        URL.from_string(response['Location']).path()
-                    )
+                    response = self.client.get(self.url)
+                    assert reverse('checkout:shipping-method') == response.url
 
 
 class RedirectToPayPalBase(MockedPayPalTests):
@@ -104,16 +103,32 @@ class RedirectToPayPalBase(MockedPayPalTests):
         self.url = URL.from_string(response['Location'])
 
 
-class RedirectToPayPalTests(RedirectToPayPalBase):
+class RedirectToPayPalTests(BasketMixin, TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.url = reverse('paypal-redirect')
 
     def test_nonempty_basket_redirects_to_paypal(self):
-        self.assertEqual('www.sandbox.paypal.com', self.url.host())
+        order_approve_url = 'https://www.sandbox.paypal.com/checkoutnow?token=4MW805572N795704B'
 
-    def test_query_params_present(self):
-        params = ['cmd', 'token']
-        self.assertTrue(self.url.has_query_params(params))
+        with patch('paypal.express.gateway.PaymentProcessor.create_order') as create_order:
+            create_order.return_value = construct_object('Result', CREATE_ORDER_RESULT_DATA_MINIMAL)
+
+            self.add_product_to_basket()
+            response = self.client.get(self.url)
+            assert response.url == order_approve_url
+
+    def test_paypal_error_redirects_to_basket(self):
+        with patch('paypal.express.gateway.PaymentProcessor.create_order') as create_order:
+            create_order.side_effect = HttpError(message='Error message', status_code=404, headers=None)
+
+            self.add_product_to_basket()
+            response = self.client.get(self.url)
+            assert reverse('basket:summary') == response.url
 
 
+@skip('Not implemented with `paypalcheckoutsdk`')
 @override_settings(PAYPAL_BUYER_PAYS_ON_PAYPAL=True)
 class RedirectWhenBuyerPaysOnPayPalTests(RedirectToPayPalBase):
 
@@ -125,6 +140,7 @@ class RedirectWhenBuyerPaysOnPayPalTests(RedirectToPayPalBase):
         self.assertTrue(self.url.has_query_params(params))
 
 
+@skip('Not implemented with `paypalcheckoutsdk`')
 class FailedTxnTests(MockedPayPalTests):
     response_body = 'TOKEN=EC%2d8P797793UC466090M&CHECKOUTSTATUS=PaymentActionNotInitiated' \
                     '&TIMESTAMP=2012%2d04%2d16T11%3a51%3a57Z&CORRELATIONID=ab8a263eb440&ACK=Failed' \
@@ -150,51 +166,59 @@ class FailedTxnTests(MockedPayPalTests):
         self.assertTrue('paypal_amount' not in self.response.context)
 
 
-class PreviewOrderTests(MockedPayPalTests):
-    response_body = 'TOKEN=EC%2d6WY34243AN3588740&CHECKOUTSTATUS=PaymentActionCompleted' \
-                    '&TIMESTAMP=2012%2d04%2d19T10%3a07%3a46Z&CORRELATIONID=7e9c5efbda3c0' \
-                    '&ACK=Success&VERSION=88%2e0&BUILD=2808426&EMAIL=david%2e_1332854868_per%40gmail%2ecom' \
-                    '&PAYERID=7ZTRBDFYYA47W&PAYERSTATUS=verified&FIRSTNAME=David&LASTNAME=Winterbottom' \
-                    '&COUNTRYCODE=GB&SHIPTONAME=David%20Winterbottom&SHIPTOSTREET=1%20Main%20Terrace' \
-                    '&SHIPTOCITY=Wolverhampton&SHIPTOSTATE=West%20Midlands&SHIPTOZIP=W12%204LQ' \
-                    '&SHIPTOCOUNTRYCODE=GB&SHIPTOCOUNTRYNAME=United%20Kingdom&ADDRESSSTATUS=Confirmed' \
-                    '&CURRENCYCODE=GBP&AMT=33%2e98&SHIPPINGAMT=0%2e00&HANDLINGAMT=0%2e00&TAXAMT=0%2e00' \
-                    '&INSURANCEAMT=0%2e00&SHIPDISCAMT=0%2e00&PAYMENTREQUEST_0_CURRENCYCODE=GBP' \
-                    '&PAYMENTREQUEST_0_AMT=33%2e98&PAYMENTREQUEST_0_SHIPPINGAMT=0%2e00' \
-                    '&PAYMENTREQUEST_0_HANDLINGAMT=0%2e00&PAYMENTREQUEST_0_TAXAMT=0%2e00' \
-                    '&PAYMENTREQUEST_0_INSURANCEAMT=0%2e00&PAYMENTREQUEST_0_SHIPDISCAMT=0%2e00' \
-                    '&PAYMENTREQUEST_0_TRANSACTIONID=51963679RW630412N' \
-                    '&PAYMENTREQUEST_0_INSURANCEOPTIONOFFERED=false&PAYMENTREQUEST_0_SHIPTONAME=David%20Winterbottom' \
-                    '&PAYMENTREQUEST_0_SHIPTOSTREET=1%20Main%20Terrace&PAYMENTREQUEST_0_SHIPTOCITY=Wolverhampton' \
-                    '&PAYMENTREQUEST_0_SHIPTOSTATE=West%20Midlands&PAYMENTREQUEST_0_SHIPTOZIP=W12%204LQ' \
-                    '&PAYMENTREQUEST_0_SHIPTOCOUNTRYCODE=GB&PAYMENTREQUEST_0_SHIPTOCOUNTRYNAME=United%20Kingdom' \
-                    '&PAYMENTREQUESTINFO_0_TRANSACTIONID=51963679RW630412N&PAYMENTREQUESTINFO_0_ERRORCODE=0' \
-                    '&SHIPPINGOPTIONNAME=Royal%20Mail%20Signed%20For%e2%84%a2%202nd%20Class'     # noqa E501
+class PreviewOrderTests(BasketMixin, TestCase):
+    fixtures = ['countries.json']
 
-    def perform_action(self):
-        self.add_product_to_basket(price=D('6.99'))
-        basket = Basket.objects.all()[0]
+    def setUp(self):
+        super().setUp()
+
+        self.add_product_to_basket(price=D('9.99'))
+        basket = Basket.objects.all().first()
         basket.freeze()
-        url = reverse('paypal-success-response', kwargs={'basket_id': basket.id})
 
-        url = URL().path(url)\
-                   .query_param('PayerID', '12345')\
-                   .query_param('token', 'EC-8P797793UC466090M')
-        self.response = self.client.get(str(url), follow=True)
+        url = reverse('paypal-success-response', kwargs={'basket_id': basket.id})
+        query_string = urlencode({'PayerID': '0000000000001', 'token': '4MW805572N795704B'})
+        self.url_with_query_string = '{}?{}'.format(url, query_string)
+
+        # Imitate selecting of shipping method in `form_valid` method of `ShippingMethodView`
+        session = self.client.session
+        session[CheckoutSessionData.SESSION_KEY] = {'shipping': {'method_code': SecondClassRecorded.code}}
+        session.save()
+
+        # Before preview order must be created
+        ExpressCheckoutTransaction.objects.create(
+            order_id='4MW805572N795704B',
+            amount=D('19.99'),
+            currency=basket.currency,
+            status=ExpressCheckoutTransaction.CREATED,
+            intent=ExpressCheckoutTransaction.CAPTURE,
+        )
 
     def test_context(self):
-        self.assertEqual(D('33.98'), self.response.context['paypal_amount'])
-        self.assertEqual('Royal Mail Signed For™ 2nd Class',
-                         force_text(self.response.context['shipping_method'].name))
-        self.assertEqual('uk_rm_2ndrecorded',
-                         force_text(self.response.context['shipping_method'].code))
+        with patch('paypal.express.gateway.PaymentProcessor.get_order') as get_order:
+            get_order.return_value = construct_object('Result', GET_ORDER_RESULT_DATA)
 
-    def test_keys_in_context(self):
-        keys = ('shipping_address', 'shipping_method',
-                'payer_id', 'token', 'paypal_user_email',
-                'paypal_amount')
-        for k in keys:
-            self.assertTrue(k in self.response.context, "%s not in context" % k)
+            response = self.client.get(self.url_with_query_string, follow=True)
+
+            context = response.context
+            assert D('19.99') == context['paypal_amount']
+            assert 'Royal Mail Signed For™ 2nd Class' == context['shipping_method'].name
+            assert 'uk_rm_2ndrecorded' == context['shipping_method'].code
+
+            keys = ('shipping_address', 'shipping_method', 'payer_id', 'token', 'paypal_user_email', 'paypal_amount')
+            for k in keys:
+                assert k in context, '{} not in context'.format(k)
+
+    def test_paypal_error_redirects_to_basket(self):
+        self.add_product_to_basket(price=D('9.99'))
+        basket = Basket.objects.all().first()
+        basket.freeze()
+
+        with patch('paypal.express.gateway.PaymentProcessor.get_order') as get_order:
+            get_order.side_effect = HttpError(message='Error message', status_code=404, headers=None)
+
+            response = self.client.get(self.url_with_query_string)
+            assert reverse('basket:summary') == response.url
 
 
 class SubmitOrderBase(MockedPayPalTests):
@@ -213,61 +237,69 @@ class SubmitOrderBase(MockedPayPalTests):
         post.side_effect = side_effect
 
 
-class SubmitOrderTests(SubmitOrderBase):
-    get_response = 'TOKEN=EC%2d6WY34243AN3588740&CHECKOUTSTATUS=PaymentActionCompleted&' \
-                   'TIMESTAMP=2012%2d04%2d19T10%3a07%3a46Z&CORRELATIONID=7e9c5efbda3c0&ACK=Success&' \
-                   'VERSION=88%2e0&BUILD=2808426&EMAIL=david%2e_1332854868_per%40gmail%2ecom&' \
-                   'PAYERID=7ZTRBDFYYA47W&PAYERSTATUS=verified&FIRSTNAME=David&LASTNAME=Winterbottom&COUNTRYCODE=GB&' \
-                   'SHIPTONAME=David%20Winterbottom&SHIPTOSTREET=1%20Main%20Terrace&SHIPTOSTREET2=line2&' \
-                   'SHIPTOCITY=Wolverhampton&SHIPTOSTATE=West%20Midlands&SHIPTOZIP=W12%204LQ&SHIPTOCOUNTRYCODE=GB&' \
-                   'SHIPTOCOUNTRYNAME=United%20Kingdom&ADDRESSSTATUS=Confirmed&CURRENCYCODE=GBP&' \
-                   'AMT=33%2e98&SHIPPINGAMT=0%2e00&HANDLINGAMT=0%2e00&TAXAMT=0%2e00&INSURANCEAMT=0%2e00&' \
-                   'SHIPDISCAMT=0%2e00&PAYMENTREQUEST_0_CURRENCYCODE=GBP&PAYMENTREQUEST_0_AMT=33%2e98&' \
-                   'PAYMENTREQUEST_0_SHIPPINGAMT=0%2e00&PAYMENTREQUEST_0_HANDLINGAMT=0%2e00&' \
-                   'PAYMENTREQUEST_0_TAXAMT=0%2e00&PAYMENTREQUEST_0_INSURANCEAMT=0%2e00&' \
-                   'PAYMENTREQUEST_0_SHIPDISCAMT=0%2e00&PAYMENTREQUEST_0_TRANSACTIONID=51963679RW630412N&' \
-                   'PAYMENTREQUEST_0_INSURANCEOPTIONOFFERED=false&PAYMENTREQUEST_0_SHIPTONAME=David%20Winterbottom&' \
-                   'PAYMENTREQUEST_0_SHIPTOSTREET=1%20Main%20Terrace&PAYMENTREQUEST_0_SHIPTOSTREET2=line2&' \
-                   'PAYMENTREQUEST_0_SHIPTOCITY=Wolverhampton&PAYMENTREQUEST_0_SHIPTOSTATE=West%20Midlands&' \
-                   'PAYMENTREQUEST_0_SHIPTOZIP=W12%204LQ&PAYMENTREQUEST_0_SHIPTOCOUNTRYCODE=GB&' \
-                   'PAYMENTREQUEST_0_SHIPTOCOUNTRYNAME=United%20Kingdom&' \
-                   'PAYMENTREQUESTINFO_0_TRANSACTIONID=51963679RW630412N&PAYMENTREQUESTINFO_0_ERRORCODE=0'
-    do_response = 'TOKEN=EC%2d6WY34243AN3588740&SUCCESSPAGEREDIRECTREQUESTED=false&' \
-                  'TIMESTAMP=2012%2d04%2d19T10%3a07%3a47Z&CORRELATIONID=3db1d5276ddfd&ACK=Success&VERSION=88%2e0&' \
-                  'BUILD=2808426&INSURANCEOPTIONSELECTED=false&SHIPPINGOPTIONISDEFAULT=false&' \
-                  'PAYMENTINFO_0_TRANSACTIONID=51963679RW630412N&PAYMENTINFO_0_TRANSACTIONTYPE=expresscheckout&' \
-                  'PAYMENTINFO_0_PAYMENTTYPE=instant&PAYMENTINFO_0_ORDERTIME=2012%2d04%2d19T09%3a42%3a50Z&' \
-                  'PAYMENTINFO_0_AMT=33%2e98&PAYMENTINFO_0_FEEAMT=1%2e36&PAYMENTINFO_0_TAXAMT=0%2e00&' \
-                  'PAYMENTINFO_0_CURRENCYCODE=GBP&PAYMENTINFO_0_PAYMENTSTATUS=Pending&' \
-                  'PAYMENTINFO_0_PENDINGREASON=paymentreview&PAYMENTINFO_0_REASONCODE=None&' \
-                  'PAYMENTINFO_0_PROTECTIONELIGIBILITY=Ineligible&PAYMENTINFO_0_PROTECTIONELIGIBILITYTYPE=None&' \
-                  'PAYMENTINFO_0_SECUREMERCHANTACCOUNTID=YYH7BB4UHPKC4&PAYMENTINFO_0_ERRORCODE=0&' \
-                  'PAYMENTINFO_0_ACK=Success'
+class SubmitOrderTests(BasketMixin, TestCase):
+    fixtures = ['countries.json']
 
-    def perform_action(self):
-        self.add_product_to_basket(price=D('6.99'))
+    def setUp(self):
+        super().setUp()
 
-        # Explicitly freeze basket
-        basket = Basket.objects.all()[0]
+        self.add_product_to_basket(price=D('9.99'))
+        basket = Basket.objects.all().first()
         basket.freeze()
-        url = reverse('paypal-place-order', kwargs={'basket_id': basket.id})
-        self.response = self.client.post(
-            url, {'action': 'place_order',
-                  'payer_id': '12345',
-                  'token': 'EC-8P797793UC466090M'})
-        self.order = Order.objects.all()[0]
 
-    def test_order_total(self):
-        self.assertEqual(D('6.99'), self.order.total_incl_tax)
+        self.url = reverse('paypal-place-order', kwargs={'basket_id': basket.id})
+        self.payload = {
+            'action': 'place_order',
+            'payer_id': '0000000000001',
+            'token': '4MW805572N795704B',
+        }
 
-    def test_order_email_address(self):
-        self.assertEqual('david._1332854868_per@gmail.com',
-                         self.order.guest_email)
+        # Imitate selecting of shipping method in `form_valid` method of `ShippingMethodView`
+        session = self.client.session
+        session[CheckoutSessionData.SESSION_KEY] = {'shipping': {'method_code': SecondClassRecorded.code}}
+        session.save()
 
-    def test_shipping_address_includes_line2(self):
-        self.assertEqual('line2', self.order.shipping_address.line2)
+        # Before getting order must be created
+        ExpressCheckoutTransaction.objects.create(
+            order_id='4MW805572N795704B',
+            amount=D('19.99'),
+            currency=basket.currency,
+            status=ExpressCheckoutTransaction.CREATED,
+            intent=ExpressCheckoutTransaction.CAPTURE,
+        )
+
+    def test_created_order(self):
+        with patch('paypal.express.gateway.PaymentProcessor.get_order') as get_order:
+            with patch('paypal.express.gateway.PaymentProcessor.capture_order') as capture_order:
+
+                get_order.return_value = construct_object('Result', GET_ORDER_RESULT_DATA)
+                capture_order.return_value = construct_object('Result', CAPTURE_ORDER_RESULT_DATA_MINIMAL)
+
+                self.client.post(self.url, self.payload)
+
+                order = Order.objects.all().first()
+                assert order.total_incl_tax == D('9.99')
+                assert order.guest_email == 'sherlock.holmes@example.com'
+
+                address = order.shipping_address
+                assert address.line1 == '221B Baker Street'
+                assert address.line4 == 'London'
+                assert address.country.iso_3166_1_a2 == 'GB'
+                assert address.postcode == 'WC2N 5DU'
+
+    def test_paypal_error(self):
+        with patch('paypal.express.gateway.PaymentProcessor.get_order') as get_order:
+            with patch('paypal.express.gateway.PaymentProcessor.capture_order') as capture_order:
+
+                get_order.return_value = construct_object('Result', GET_ORDER_RESULT_DATA)
+                capture_order.side_effect = HttpError(message='Error message', status_code=404, headers=None)
+
+                response = self.client.post(self.url, self.payload)
+                expected_message = 'A problem occurred during payment capturing - please try again later'
+                assert expected_message in response.content.decode()
 
 
+@skip('Not implemented with `paypalcheckoutsdk`')
 @override_settings(PAYPAL_BUYER_PAYS_ON_PAYPAL=True)
 class BuyerPaysOnPaypalResponseTests(SubmitOrderBase):
     get_response = 'TOKEN=EC%2d7F151994RW7618524&BILLINGAGREEMENTACCEPTEDSTATUS=0&' \
@@ -337,6 +369,7 @@ class BuyerPaysOnPaypalResponseTests(SubmitOrderBase):
         self.assertEqual(self.client.post(self.url, {}).status_code, 400)
 
 
+@skip('Implemented in `SubmitOrderTests`')
 class SubmitOrderErrorsTests(MockedPayPalTests):
 
     def perform_action(self):
