@@ -13,3 +13,5 @@ django-extensions==3.0.9
 django-debug-toolbar==3.1.1
 flake8
 isort
+
+paypal-checkout-serversdk

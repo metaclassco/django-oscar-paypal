@@ -178,7 +178,7 @@ class PreviewOrderTests(BasketMixin, TestCase):
 
         url = reverse('paypal-success-response', kwargs={'basket_id': basket.id})
         query_string = urlencode({'PayerID': '0000000000001', 'token': '4MW805572N795704B'})
-        self.url_with_query_string = '{}?{}'.format(url, query_string)
+        self.url_with_query_string = f'{url}?{query_string}'
 
         # Imitate selecting of shipping method in `form_valid` method of `ShippingMethodView`
         session = self.client.session
@@ -207,7 +207,7 @@ class PreviewOrderTests(BasketMixin, TestCase):
 
             keys = ('shipping_address', 'shipping_method', 'payer_id', 'token', 'paypal_user_email', 'paypal_amount')
             for k in keys:
-                assert k in context, '{} not in context'.format(k)
+                assert k in context, f'{k} not in context'
 
     def test_paypal_error_redirects_to_basket(self):
         self.add_product_to_basket(price=D('9.99'))

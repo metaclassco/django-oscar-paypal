@@ -4,6 +4,7 @@ from decimal import Decimal as D
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.template.defaultfilters import striptags, truncatechars
+from django.utils.translation import gettext_lazy as _
 
 from paypalcheckoutsdk.core import LiveEnvironment, PayPalHttpClient, SandboxEnvironment
 from paypalcheckoutsdk.orders import (
@@ -49,7 +50,8 @@ def format_amount(amount):
 def get_landing_page():
     landing_page = getattr(settings, 'PAYPAL_LANDING_PAGE', LANDING_PAGE_NO_PREFERENCE)
     if landing_page not in (LANDING_PAGE_LOGIN, LANDING_PAGE_BILLING, LANDING_PAGE_NO_PREFERENCE):
-        raise ImproperlyConfigured('{} is not a valid landing page'.format(landing_page))
+        message = _("'%s' is not a valid landing page") % landing_page
+        raise ImproperlyConfigured(message)
     return landing_page
 
 
@@ -158,7 +160,7 @@ class PaymentProcessor:
             address=None, shipping_charge=None, intent=None, preferred_response='minimal',
     ):
         request = OrdersCreateRequest()
-        request.prefer('return={}'.format(preferred_response))
+        request.prefer(f'return={preferred_response}')
         request.request_body(self.build_order_create_request_body(
             basket=basket,
             currency=currency,
@@ -202,6 +204,6 @@ class PaymentProcessor:
     def capture_order(self, token, intent, preferred_response='minimal'):
         capture_request = INTENT_REQUEST_MAPPING[intent]
         request = capture_request(token)
-        request.prefer('return={}'.format(preferred_response))
+        request.prefer(f'return={preferred_response}')
         response = self.client.execute(request)
         return response.result

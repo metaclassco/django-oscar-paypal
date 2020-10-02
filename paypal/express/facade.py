@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib.sites.models import Site
 from django.core.exceptions import ImproperlyConfigured
 from django.urls import reverse
+from django.utils.translation import gettext_lazy as _
 
 from paypal.express.gateway import PaymentProcessor
 from paypal.express.models import ExpressCheckoutTransaction as Transaction
@@ -15,7 +16,8 @@ from paypal.express.models import ExpressCheckoutTransaction as Transaction
 def get_intent():
     intent = getattr(settings, 'PAYPAL_ORDER_INTENT', Transaction.CAPTURE)
     if intent not in (Transaction.CAPTURE, Transaction.AUTHORIZE):
-        raise ImproperlyConfigured('{} is not a valid order intent'.format(intent))
+        message = _("'%s' is not a valid order intent") % intent
+        raise ImproperlyConfigured(message)
     return intent
 
 
@@ -36,10 +38,10 @@ def get_paypal_url(basket, user=None, shipping_address=None, shipping_method=Non
         host = Site.objects.get_current().domain
     scheme = getattr(settings, 'PAYPAL_CALLBACK_SCHEME', 'https')
     return_url_path = reverse('paypal-success-response', kwargs={'basket_id': basket.id})
-    return_url = '{0}://{1}{2}'.format(scheme, host, return_url_path)
+    return_url = f'{scheme}://{host}{return_url_path}'
 
     cancel_url_path = reverse('paypal-cancel-response', kwargs={'basket_id': basket.id})
-    cancel_url = '{0}://{1}{2}'.format(scheme, host, cancel_url_path)
+    cancel_url = f'{scheme}://{host}{cancel_url_path}'
 
     address = None
     if basket.is_shipping_required():
