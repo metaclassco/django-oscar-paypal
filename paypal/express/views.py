@@ -290,7 +290,8 @@ class SuccessResponseView(PaymentDetailsView):
             source_type=source_type,
             currency=self.txn.currency,
             amount_allocated=amount,
-            amount_debited=amount
+            amount_debited=amount,
+            reference=self.token,
         )
         self.add_payment_source(source)
         self.add_payment_event('Settled', amount, reference=self.txn.capture_id)
