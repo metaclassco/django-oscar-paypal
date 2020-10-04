@@ -114,7 +114,7 @@ def capture_order(token):
         capture_token = transaction.order_id
 
     result = PaymentProcessor().capture_order(capture_token, transaction.intent)
-    transaction.capture_id = result.id
+    transaction.capture_id = result.purchase_units[0].payments.captures[0].id
     transaction.status = result.status
     transaction.save()
     return transaction
