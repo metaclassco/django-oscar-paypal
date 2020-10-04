@@ -291,6 +291,10 @@ OSCAR_DASHBOARD_NAVIGATION.append(
                 'label': _('Express transactions'),
                 'url_name': 'express_dashboard:paypal-express-list',
             },
+            {
+                'label': _('Express transactions (Legacy)'),
+                'url_name': 'express_dashboard:legacy-paypal-express-list',
+            },
         ]
     })
 

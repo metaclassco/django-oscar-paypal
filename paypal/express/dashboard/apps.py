@@ -11,16 +11,18 @@ class ExpressDashboardApplication(OscarDashboardConfig):
 
     default_permissions = ["is_staff"]
 
-    def ready(self):
-        from . import views
-        self.list_view = views.TransactionListView
-        self.detail_view = views.TransactionDetailView
-
     def get_urls(self):
+        from . import views
+
         urlpatterns = [
-            path('transactions/', self.list_view.as_view(),
+            path('legacy/transactions/', views.LegacyTransactionListView.as_view(),
+                 name='legacy-paypal-express-list'),
+            path('legacy/transactions/<int:pk>/', views.LegacyTransactionDetailView.as_view(),
+                 name='legacy-paypal-express-detail'),
+
+            path('transactions/', views.TransactionListView.as_view(),
                  name='paypal-express-list'),
-            path('transactions/<int:pk>/', self.detail_view.as_view(),
+            path('transactions/<int:pk>/', views.TransactionDetailView.as_view(),
                  name='paypal-express-detail'),
         ]
         return self.post_process_urls(urlpatterns)
