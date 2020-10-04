@@ -194,9 +194,9 @@ class PaymentProcessor:
         response = self.client.execute(request)
         return response.result
 
-    def refund_order(self, capture_id, amount, currency):
+    def refund_order(self, capture_id, amount, currency, preferred_response='minimal'):
         request = CapturesRefundRequest(capture_id)
-        request.prefer('return=representation')  # TODO: probably here we can use default `prefer`?
+        request.prefer(f'return={preferred_response}')
         request.request_body(self.build_refund_order_request_body(amount, currency))
         response = self.client.execute(request)
         return response.result
